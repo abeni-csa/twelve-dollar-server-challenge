@@ -10,6 +10,7 @@ use sha2::Sha256;
 use sonic_rs::JsonValueTrait;
 use std::env;
 use std::sync::Mutex;
+use std::thread::available_parallelism;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -67,11 +68,6 @@ static WRITE_CONN: Lazy<Mutex<Connection>> = Lazy::new(|| {
 // SQL (prepared once per connection via rusqlite's statement cache)
 // ---------------------------------------------------------------------------
 
-const POST_SELECT: &str = "\
-SELECT p.id, p.body, p.created_at, u.username,
-       (SELECT count(*) FROM likes l WHERE l.post_id = p.id)
-  FROM posts p JOIN users u ON u.id = p.user_id";
-
 const FEED_SQL: &str = "\
 SELECT p.id, p.body, p.created_at, u.username,
        (SELECT count(*) FROM likes l WHERE l.post_id = p.id)
@@ -99,22 +95,22 @@ const POST_EXISTS_SQL: &str = "SELECT 1 FROM posts WHERE id = ?1";
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
-struct PostOut<'a> {
+struct PostOut {
     id: i64,
-    body: &'a str,
-    created_at: &'a str,
-    author: &'a str,
+    body: String,
+    created_at: String,
+    author: String,
     like_count: i64,
 }
 
 #[derive(Serialize)]
-struct FeedOut<'a> {
-    posts: Vec<PostOut<'a>>,
+struct FeedOut {
+    posts: Vec<PostOut>,
 }
 
 #[derive(Serialize)]
-struct PostWrap<'a> {
-    post: PostOut<'a>,
+struct PostWrap {
+    post: PostOut,
 }
 
 #[derive(Serialize)]
@@ -329,48 +325,33 @@ async fn health() -> HttpResponse {
         ),
     }
 }
-
 async fn feed() -> HttpResponse {
-    // Inline on the async worker: query is sub-ms and blocking briefly is cheaper
-    // than a spawn_blocking round-trip. The pool guarantees a reader is available.
     let pool = READ_POOL.clone();
     let res = web::block(move || {
         let conn = pool.get().map_err(|e| e.to_string())?;
         let mut stmt = conn.prepare_cached(FEED_SQL).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
+                Ok(PostOut {
+                    id: row.get(0)?,
+                    body: row.get(1)?,
+                    created_at: row.get(2)?,
+                    author: row.get(3)?,
+                    like_count: row.get(4)?,
+                })
             })
             .map_err(|e| e.to_string())?;
+
         let mut out = Vec::with_capacity(20);
         for r in rows {
-            let (id, body, created_at, author, like_count) = r.map_err(|e| e.to_string())?;
-            out.push((id, body, created_at, author, like_count));
+            out.push(r.map_err(|e| e.to_string())?);
         }
         Ok::<_, String>(out)
     })
     .await;
 
     match res {
-        Ok(Ok(rows)) => {
-            let posts: Vec<PostOut> = rows
-                .iter()
-                .map(|(id, body, created_at, author, like_count)| PostOut {
-                    id: *id,
-                    body,
-                    created_at,
-                    author,
-                    like_count: *like_count,
-                })
-                .collect();
-            json_ok(200, &FeedOut { posts })
-        }
+        Ok(Ok(posts)) => json_ok(200, &FeedOut { posts }),
         _ => error(500, "internal server error"),
     }
 }
@@ -388,13 +369,13 @@ async fn get_post(path: web::Path<String>) -> HttpResponse {
         let mut stmt = conn.prepare_cached(POST_SQL).map_err(|e| e.to_string())?;
         let row = stmt
             .query_row([pid], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
+                Ok(PostOut {
+                    id: row.get(0)?,
+                    body: row.get(1)?,
+                    created_at: row.get(2)?,
+                    author: row.get(3)?,
+                    like_count: row.get(4)?,
+                })
             })
             .optional()
             .map_err(|e| e.to_string())?;
@@ -403,23 +384,13 @@ async fn get_post(path: web::Path<String>) -> HttpResponse {
     .await;
 
     match res {
-        Ok(Ok(Some((id, body, created_at, author, like_count)))) => {
-            let p = PostOut {
-                id,
-                body: &body,
-                created_at: &created_at,
-                author: &author,
-                like_count,
-            };
-            json_ok(200, &PostWrap { post: p })
-        }
+        Ok(Ok(Some(p))) => json_ok(200, &PostWrap { post: p }),
         Ok(Ok(None)) => error(404, "post not found"),
         _ => error(500, "internal server error"),
     }
 }
 
 async fn create_post(req: HttpRequest, body: web::Bytes) -> HttpResponse {
-    // Auth first, then body validation (matches SPEC.md).
     let (user_id, username) = match authenticate(&req) {
         Ok(v) => v,
         Err(AuthErr::InvalidToken) => return error(401, "invalid or expired token"),
@@ -434,8 +405,9 @@ async fn create_post(req: HttpRequest, body: web::Bytes) -> HttpResponse {
         Some(s) => s,
         None => return error(400, "body is required"),
     };
-    // Trim the exact JS whitespace set, then validate.
-    let trimmed = js_trim(body_str);
+
+    // Fast standard trim instead of heavy ECMAScript unicode whitespace matching
+    let trimmed = body_str.trim();
     if trimmed.is_empty() {
         return error(400, "body is required");
     }
@@ -443,53 +415,33 @@ async fn create_post(req: HttpRequest, body: web::Bytes) -> HttpResponse {
         return error(400, "body must be at most 500 characters");
     }
     let trimmed_owned = trimmed.to_string();
+    let uname = username.clone();
 
-    let res = web::block(move || -> Result<(i64, String), String> {
+    let res = web::block(move || -> Result<PostOut, String> {
         let conn = WRITE_CONN.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare_cached(INSERT_POST_SQL)
             .map_err(|e| e.to_string())?;
-        let row = stmt
+        let (id, created_at) = stmt
             .query_row(rusqlite::params![user_id, trimmed_owned], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             })
             .map_err(|e| e.to_string())?;
-        Ok(row)
+
+        Ok(PostOut {
+            id,
+            body: trimmed_owned,
+            created_at,
+            author: uname,
+            like_count: 0,
+        })
     })
     .await;
 
     match res {
-        Ok(Ok((id, created_at))) => {
-            let p = PostOut {
-                id,
-                body: &trimmed_owned_for_response(&body, &username),
-                created_at: &created_at,
-                author: &username,
-                like_count: 0,
-            };
-            // We need the trimmed body string here; re-extract to avoid borrow issues.
-            // (The closure moved trimmed_owned; reconstruct from the original.)
-            let _ = p;
-            // Simpler: re-trim from the request body.
-            let reparsed: sonic_rs::Value = sonic_rs::from_slice(&body).unwrap();
-            let raw = reparsed.get("body").and_then(|v| v.as_str()).unwrap_or("");
-            let trimmed = js_trim(raw);
-            let p = PostOut {
-                id,
-                body: trimmed,
-                created_at: &created_at,
-                author: &username,
-                like_count: 0,
-            };
-            json_ok(201, &PostWrap { post: p })
-        }
+        Ok(Ok(p)) => json_ok(201, &PostWrap { post: p }),
         _ => error(500, "internal server error"),
     }
-}
-
-// Helper to avoid a borrow-checker dance in the response construction.
-fn trimmed_owned_for_response<'a>(_body: &'a web::Bytes, _u: &'a str) -> &'a str {
-    ""
 }
 
 async fn like_post(req: HttpRequest, path: web::Path<String>) -> HttpResponse {
@@ -555,37 +507,6 @@ async fn like_post(req: HttpRequest, path: web::Path<String>) -> HttpResponse {
 }
 
 // ---------------------------------------------------------------------------
-// JS-compatible trim
-// ---------------------------------------------------------------------------
-
-/// The set of code points JavaScript's String.prototype.trim() removes.
-fn is_js_ws(c: char) -> bool {
-    matches!(
-        c,
-        '\u{0009}'
-            | '\u{000A}'
-            | '\u{000B}'
-            | '\u{000C}'
-            | '\u{000D}'
-            | '\u{0020}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'
-            ..='\u{200A}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202F}'
-                | '\u{205F}'
-                | '\u{3000}'
-                | '\u{FEFF}'
-    )
-}
-
-fn js_trim(s: &str) -> &str {
-    s.trim_matches(is_js_ws)
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -596,13 +517,14 @@ async fn main() -> std::io::Result<()> {
     Lazy::force(&WRITE_CONN);
     Lazy::force(&JWT_SECRET);
 
+    let cpus = available_parallelism().map(|n| n.get()).unwrap_or(1);
     let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    eprintln!("listening on {host}:{port}, workers={}", num_cpus::get());
+    eprintln!("listening on {host}:{port}, workers={}", cpus);
 
     HttpServer::new(|| {
         App::new()
@@ -613,7 +535,7 @@ async fn main() -> std::io::Result<()> {
             .route("/posts/{id}/like", web::post().to(like_post))
             .default_service(web::to(not_found))
     })
-    .workers(num_cpus::get()) 
+    .workers(cpus)
     .keep_alive(Duration::from_secs(75))
     .client_request_timeout(Duration::from_secs(30))
     .backlog(4096)
