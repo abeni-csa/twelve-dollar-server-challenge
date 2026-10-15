@@ -12,19 +12,15 @@ use std::env;
 use std::sync::Mutex;
 use std::thread::available_parallelism;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-
 static JWT_SECRET: Lazy<Vec<u8>> = Lazy::new(|| {
     env::var("JWT_SECRET")
         .unwrap_or_else(|_| "twelve-dollar-challenge".into())
         .into_bytes()
 });
-
 static START: Lazy<SystemTime> = Lazy::new(SystemTime::now);
-
 /// Read pool: many concurrent readers (WAL allows this).
 static READ_POOL: Lazy<Pool<SqliteConnectionManager>> = Lazy::new(|| {
     let path = env::var("SQLITE_PATH").expect("SQLITE_PATH must be set");
